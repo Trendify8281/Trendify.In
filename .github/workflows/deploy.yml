@@ -1,0 +1,535 @@
+name: Deploy
+
+on:
+  # Manual trigger from Actions tab - click "Run workflow"
+  workflow_dispatch:
+    inputs:
+      skip_template_update:
+        description: 'Skip template update'
+        required: false
+        default: true
+        type: boolean
+      skip_deploy_hosting:
+        description: 'Skip deploy hosting'
+        required: false
+        default: false
+        type: boolean
+      skip_deploy_firestore:
+        description: 'Skip deploy firestore'
+        required: false
+        default: false
+        type: boolean
+      skip_deploy_functions:
+        description: 'Skip deploy functions'
+        required: false
+        default: true
+        type: boolean
+      skip_deploy_storage:
+        description: 'Skip deploy storage'
+        required: false
+        default: false
+        type: boolean
+  
+  # Automatic weekly template updates every Monday at 9 AM UTC
+  schedule:
+    - cron: '0 9 * * 1'
+  
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+# Permissions for the workflow
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: write
+
+jobs:
+  # Template update job (always runs for build dependency, but steps are conditional)
+  update-from-template:
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.check-updates.outputs.has_updates || 'false' }}
+      merge_success: ${{ steps.auto-merge.outputs.merge_success || 'false' }}
+      should_run: ${{ steps.should-update.outputs.should_run || 'false' }}
+    
+    steps:
+      - name: Check if template update should run
+        id: should-update
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]] || \
+             ([[ "${{ github.event_name }}" == "workflow_dispatch" ]] && \
+              [[ "${{ inputs.skip_template_update }}" != "true" ]] && \
+              [[ "${{ github.ref }}" == "refs/heads/main" ]]); then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "✅ Template update will run"
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Template update skipped (only runs on schedule or manual trigger on main branch)"
+          fi
+
+      - name: Checkout repository
+        if: steps.should-update.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        if: steps.should-update.outputs.should_run == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch updates
+        if: steps.should-update.outputs.should_run == 'true'
+        run: |
+          git remote add upstream https://github.com/codzoc/quick-comm-template.git || true
+          git fetch upstream main
+          echo "✅ Fetched latest updates from template repository"
+
+      - name: Check for updates
+        if: steps.should-update.outputs.should_run == 'true'
+        id: check-updates
+        run: |
+          if git diff --quiet main upstream/main; then
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No updates available - your repo is already up to date!"
+          else
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "✅ Updates available from template"
+          fi
+
+      - name: Merge upstream changes (always accept incoming)
+        if: steps.should-update.outputs.should_run == 'true' && steps.check-updates.outputs.has_updates == 'true'
+        id: auto-merge
+        run: |
+          # Always accept incoming changes from upstream/main (--theirs strategy)
+          # This overwrites any local modifications, making this repo a copy of the main repo
+          echo "🔄 Merging upstream changes (accepting all incoming changes)..."
+          
+          # Use --no-commit to stage changes first, then exclude workflow files before committing
+          git merge --no-commit --no-ff upstream/main --allow-unrelated-histories -X theirs || {
+            # If merge still has conflicts even with -X theirs, resolve them by accepting theirs
+            echo "⚠️ Resolving any remaining conflicts by accepting incoming changes..."
+            # For any conflicted files, accept the incoming version (theirs)
+            git checkout --theirs . 2>/dev/null || true
+            git add -A
+          }
+          
+          # Exclude workflow files from commit (GitHub Actions cannot modify workflow files)
+          # Save the current state of workflow files before merging
+          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+          
+          # Stage all changes (including merged workflow files temporarily)
+          git add -A
+          
+          # Remove workflow files from staging
+          git reset HEAD .github/workflows/ 2>/dev/null || true
+          
+          # Restore workflow files to HEAD version (current repo's version)
+          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+          
+          echo "✅ Excluded workflow files from commit (keeping current version)"
+          
+          # Commit all changes except workflow files
+          git commit -m "chore: update from template repository
+
+          Updates from codzoc/quick-comm-template
+
+          This automated update brings the latest improvements, bug fixes, and features from the original template.
+          All conflicts resolved by accepting incoming changes from upstream.
+          
+          Note: .github/workflows/ files are excluded from automatic updates.
+          Please manually update workflow files if needed.
+
+          🤖 Generated by Deploy workflow"
+          
+          echo "merge_success=true" >> $GITHUB_OUTPUT
+          echo "✅ Successfully merged and committed upstream changes (excluding workflow files)"
+
+
+      - name: Push updates to main
+        if: steps.should-update.outputs.should_run == 'true' && steps.check-updates.outputs.has_updates == 'true' && steps.auto-merge.outputs.merge_success == 'true'
+        run: |
+          git push origin main
+          echo "✅ Successfully pushed updates to main branch"
+
+  # Build job - runs for PRs and pushes (always after template update)
+  build:
+    runs-on: ubuntu-latest
+    needs: update-from-template
+    if: |
+      github.event_name == 'pull_request' || 
+      github.event_name == 'push' || 
+      github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          CI: true
+
+      - name: Normalize and validate Firebase config secret
+        env:
+          FIREBASE_CONFIG_RAW: ${{ secrets.VITE_FIREBASE_CONFIG }}
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+
+          let raw = (process.env.FIREBASE_CONFIG_RAW || '').trim();
+          if (!raw) {
+            throw new Error('VITE_FIREBASE_CONFIG is empty. Paste the Firebase config object from Firebase Console.');
+          }
+
+          // Allow users to paste either:
+          // 1) strict JSON, or
+          // 2) Firebase console JS snippet like "const firebaseConfig = { ... };"
+          raw = raw.replace(/^const\s+\w+\s*=\s*/, '').trim();
+          if (raw.endsWith(';')) raw = raw.slice(0, -1).trim();
+
+          let config;
+          try {
+            config = JSON.parse(raw);
+          } catch (jsonError) {
+            try {
+              config = Function('"use strict"; return (' + raw + ');')();
+            } catch (jsError) {
+              throw new Error(
+                'VITE_FIREBASE_CONFIG could not be parsed. Paste the config object directly from Firebase Console.'
+              );
+            }
+          }
+
+          const requiredKeys = [
+            'apiKey',
+            'authDomain',
+            'projectId',
+            'storageBucket',
+            'messagingSenderId',
+            'appId'
+          ];
+
+          const missing = requiredKeys.filter((key) => !config[key]);
+          if (missing.length > 0) {
+            throw new Error(`VITE_FIREBASE_CONFIG is missing keys: ${missing.join(', ')}`);
+          }
+
+          fs.writeFileSync('config.json', JSON.stringify(config));
+          console.log('✅ VITE_FIREBASE_CONFIG is valid');
+          NODE
+
+      - name: Create .env and .firebaserc from config
+        run: |
+          cat config.json | jq -r '"VITE_FIREBASE_API_KEY=" + .apiKey' > .env
+          cat config.json | jq -r '"VITE_FIREBASE_AUTH_DOMAIN=" + .authDomain' >> .env
+          cat config.json | jq -r '"VITE_FIREBASE_PROJECT_ID=" + .projectId' >> .env
+          cat config.json | jq -r '"VITE_FIREBASE_STORAGE_BUCKET=" + .storageBucket' >> .env
+          cat config.json | jq -r '"VITE_FIREBASE_MESSAGING_SENDER_ID=" + .messagingSenderId' >> .env
+          cat config.json | jq -r '"VITE_FIREBASE_APP_ID=" + .appId' >> .env
+          cat config.json | jq -r '"VITE_FIREBASE_MEASUREMENT_ID=" + .measurementId' >> .env
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' | jq '{projects: {default: .project_id}}' > .firebaserc
+          rm config.json
+
+      - name: Build project
+        run: npm run build
+
+      - name: Copy .firebaserc to dist
+        run: cp .firebaserc dist/.firebaserc
+
+      - name: Extract project ID
+        id: firebase-config
+        run: |
+          PROJECT_ID=$(cat .firebaserc | jq -r '.projects.default')
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+          include-hidden-files: true
+          retention-days: 1
+
+  # Setup Firebase permissions and authentication (runs once for all deployment jobs)
+  setup-firebase:
+    runs-on: ubuntu-latest
+    needs: build
+    if: always() && needs.build.result == 'success'
+    
+    outputs:
+      project_id: ${{ steps.firebase-config.outputs.project_id }}
+    
+    steps:
+      - name: Create .firebaserc from service account
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' | jq '{projects: {default: .project_id}}' > .firebaserc
+
+      - name: Extract project ID
+        id: firebase-config
+        run: |
+          PROJECT_ID=$(cat .firebaserc | jq -r '.projects.default')
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Grant Storage Service Account IAM Role for Firestore Access
+        continue-on-error: true
+        run: |
+          PROJECT_ID="${{ steps.firebase-config.outputs.project_id }}"
+          STORAGE_SA="service-$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')@gs-project-accounts.iam.gserviceaccount.com"
+          echo "Granting Datastore User role to Storage service account: $STORAGE_SA"
+          gcloud projects add-iam-policy-binding $PROJECT_ID \
+            --member="serviceAccount:$STORAGE_SA" \
+            --role="roles/datastore.user" \
+            --condition=None
+          echo "✅ Storage service account permission granted (or already exists)"
+
+      - name: Grant necessary Firebase permissions to service account
+        continue-on-error: true
+        run: |
+          PROJECT_ID="${{ steps.firebase-config.outputs.project_id }}"
+          
+          # Get the service account email from the credentials
+          SERVICE_ACCOUNT_EMAIL=$(echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' | jq -r '.client_email')
+          
+          echo "Granting necessary permissions to service account: $SERVICE_ACCOUNT_EMAIL"
+          echo "Note: If this fails, ensure the service account has Project IAM Admin role to grant these permissions."
+          echo "Alternatively, grant these roles manually in Google Cloud Console IAM."
+          
+          # Grant Firebase Admin role
+          gcloud projects add-iam-policy-binding $PROJECT_ID \
+            --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+            --role="roles/firebase.admin" \
+            --condition=None || echo "Firebase Admin role already granted or insufficient permissions to grant"
+          
+          # Grant Cloud Functions Admin role (for functions deployment)
+          gcloud projects add-iam-policy-binding $PROJECT_ID \
+            --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+            --role="roles/cloudfunctions.admin" \
+            --condition=None || echo "Cloud Functions Admin role already granted or insufficient permissions to grant"
+          
+          # Grant Storage Admin role (for storage rules deployment)
+          gcloud projects add-iam-policy-binding $PROJECT_ID \
+            --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+            --role="roles/storage.admin" \
+            --condition=None || echo "Storage Admin role already granted or insufficient permissions to grant"
+          
+          # Grant Service Account User role (for functions to use other service accounts)
+          gcloud projects add-iam-policy-binding $PROJECT_ID \
+            --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+            --role="roles/iam.serviceAccountUser" \
+            --condition=None || echo "Service Account User role already granted or insufficient permissions to grant"
+          
+          echo "✅ Firebase permissions check complete (roles may already be granted)"
+
+
+  # Deploy Firestore (rules and indexes) - runs in parallel with other deployments
+  deploy-firestore:
+    runs-on: ubuntu-latest
+    needs: setup-firebase
+    if: always() && needs.setup-firebase.result == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create .firebaserc from service account
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' | jq '{projects: {default: .project_id}}' > .firebaserc
+
+      - name: Extract project ID
+        id: firebase-config
+        run: |
+          PROJECT_ID=$(cat .firebaserc | jq -r '.projects.default')
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Firestore Rules and Indexes
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && !inputs.skip_deploy_firestore)
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only firestore --project ${{ steps.firebase-config.outputs.project_id }}
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Deploy Firestore Rules and Indexes (Preview)
+        if: github.event_name == 'pull_request'
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only firestore --project ${{ steps.firebase-config.outputs.project_id }}
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+  # Deploy Storage Rules - runs in parallel with other deployments
+  deploy-storage:
+    runs-on: ubuntu-latest
+    needs: setup-firebase
+    if: always() && needs.setup-firebase.result == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create .firebaserc from service account
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' | jq '{projects: {default: .project_id}}' > .firebaserc
+
+      - name: Extract project ID
+        id: firebase-config
+        run: |
+          PROJECT_ID=$(cat .firebaserc | jq -r '.projects.default')
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Storage Rules
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && !inputs.skip_deploy_storage)
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only storage --project ${{ steps.firebase-config.outputs.project_id }} --non-interactive
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Deploy Storage Rules (Preview)
+        if: github.event_name == 'pull_request'
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only storage --project ${{ steps.firebase-config.outputs.project_id }} --non-interactive
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+  # Deploy Functions - runs in parallel with other deployments
+  deploy-functions:
+    runs-on: ubuntu-latest
+    needs: setup-firebase
+    if: always() && needs.setup-firebase.result == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create .firebaserc from service account
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' | jq '{projects: {default: .project_id}}' > .firebaserc
+
+      - name: Extract project ID
+        id: firebase-config
+        run: |
+          PROJECT_ID=$(cat .firebaserc | jq -r '.projects.default')
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Install Functions Dependencies
+        working-directory: functions
+        run: npm ci
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Functions
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && !inputs.skip_deploy_functions)
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only functions --force --project ${{ steps.firebase-config.outputs.project_id }}
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Deploy Functions (Preview)
+        if: github.event_name == 'pull_request'
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only functions --force --project ${{ steps.firebase-config.outputs.project_id }}
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+  # Deploy Hosting - runs in parallel with other deployments
+  deploy-hosting:
+    runs-on: ubuntu-latest
+    needs: [build, setup-firebase]
+    if: always() && needs.build.result == 'success' && needs.setup-firebase.result == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+
+      - name: Create .firebaserc from service account
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' | jq '{projects: {default: .project_id}}' > .firebaserc
+
+      - name: Extract project ID
+        id: firebase-config
+        run: |
+          PROJECT_ID=$(cat .firebaserc | jq -r '.projects.default')
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Firebase Preview Channel
+        if: github.event_name == 'pull_request'
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}'
+          projectId: '${{ steps.firebase-config.outputs.project_id }}'
+          expires: 7d
+        env:
+          FIREBASE_CLI_PREVIEWS: hostingchannels
+
+      - name: Deploy to Firebase Hosting (Production)
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && !inputs.skip_deploy_hosting)
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}'
+          projectId: '${{ steps.firebase-config.outputs.project_id }}'
+          channelId: live
+

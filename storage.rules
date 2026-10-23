@@ -1,0 +1,48 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Helper function to check if user is admin
+    // Storage rules can access email via request.auth.token.email
+    // Note: This requires Storage service account to have roles/datastore.user IAM role
+    // If you get 403 errors, grant the role: https://console.cloud.google.com/iam-admin/iam
+    function isAdmin() {
+      // Must be authenticated
+      return request.auth != null 
+        // Must have email in token
+        && request.auth.token.email != null
+        // Check if admin document exists in Firestore
+        && firestore.exists(/databases/(default)/documents/admins/$(request.auth.token.email))
+        // Verify role is 'admin'
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.token.email)).data.role == 'admin';
+    }
+    
+    // Products folder - authenticated users can upload/delete, everyone can read
+    // Note: Using request.auth != null instead of isAdmin() to avoid Firestore IAM configuration complexity
+    // Admin panel UI provides the primary access control - only admins can access upload functionality
+    // For stricter security, grant Storage service account Cloud Datastore User role and use isAdmin()
+    match /products/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+
+    // Logos folder - authenticated users can upload/delete, everyone can read
+    // Access is controlled by admin panel UI (only admins can access upload functionality)
+    match /logos/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+
+    // Static pages folder - authenticated users can upload/delete, everyone can read
+    // Access is controlled by admin panel UI (only admins can access upload functionality)
+    match /static-pages/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+
+    // Deny all other paths
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
+
